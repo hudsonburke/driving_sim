@@ -10,15 +10,14 @@ yaw_window_size = 15  # proposed 30 / old 4
 
 yaw_vel_threshold = 0.5
 # 4 and 10 completely got rid of it. Maybe we still want some?
-gear_dampening_scale_factor = 7 
+gear_dampening_scale_factor = 7
 gear_dampening_window_size = 20
 
-# These shoud
-roll_scale_factor = 0.4 
+roll_scale_factor = 0.4
 pitch_scale_factor = 0.4
 yaw_scale_factor = 1.0
 
-roll_degree_excursion = 25 
+roll_degree_excursion = 25
 pitch_degree_excursion = 28
 yaw_degree_excursion = 29
 
@@ -32,126 +31,141 @@ yaw_actuator_min = 0
 
 x_accel_limit = 1  # Gs (corresponds to roll)
 z_accel_limit = 1  # Gs (corresponds to pitch)
+g_force_is_in_g = True
 
-shift_rpm_threshold = 800
+
+def signed_angle_diff(a, b):
+    return (a - b + np.pi) % (2 * np.pi) - np.pi
+
 
 def main():
-    moog = MOOG()
-    time.sleep(2)
-    while moog.state != 'IDLE':
-        print('Resetting...')
-        moog.reset()
-        time.sleep(1/60)
-    moog.initialize_platform()
-    asm = accSharedMemory()
+    moog = None
+    asm = None
 
-    roll_avg = np.zeros(roll_window_size)
-    pitch_avg = np.zeros(pitch_window_size)
-    yaw_avg = np.zeros(yaw_window_size)
+    try:
+        moog = MOOG()
+        asm = accSharedMemory()
 
-    index = 0
-    gear_dampening_index = 0
-    initialized = False
-    frequency = 960  # Hz
-    previous_gear = 0
-    while True:
-        start_time = time.time()
-        sm = asm.read_shared_memory()
+        if moog.state in {'FAULT2', 'FAULT3', 'INHIBITED'}:
+            print('Resetting...')
+            if not moog.wait_until(lambda: moog.state == 'IDLE', timeout=5.0, on_poll=moog.reset):
+                raise TimeoutError(f'Timed out resetting MOOG. Current state: {moog.state}')
+        elif moog.state != 'IDLE':
+            if not moog.wait_until(lambda: moog.state == 'IDLE', timeout=5.0):
+                raise TimeoutError(f'Timed out waiting for MOOG to become IDLE. Current state: {moog.state}')
 
-        if sm is None: continue
+        moog.initialize_platform()
 
-        if not moog.is_engaged(): 
-            print("MOOG not engaged. Exiting Assetto program")
-            break
+        roll_avg = np.zeros(roll_window_size)
+        pitch_avg = np.zeros(pitch_window_size)
+        yaw_avg = np.zeros(yaw_window_size)
 
-        roll = sm.Physics.roll
-        pitch = sm.Physics.pitch
-        heading = sm.Physics.heading
-        vel_x = sm.Physics.velocity.x
-        vel_z = sm.Physics.velocity.z
+        index = 0
+        gear_dampening_index = 0
+        initialized = False
+        frequency = 120  # Hz
+        period = 1 / frequency
+        previous_gear = 0
 
-        if abs(vel_x) < yaw_vel_threshold and abs(vel_z) < yaw_vel_threshold:
-            vel_angle = heading
-        else:
-            vel_angle = -np.arctan2([vel_x], [vel_z])[0]
+        while True:
+            start_time = time.monotonic()
+            sm = asm.read_shared_memory()
 
-        # https://stackoverflow.com/questions/1878907/how-can-i-find-the-difference-between-two-angles#comment1927356_2007355
+            if sm is None:
+                elapsed_time = time.monotonic() - start_time
+                sleep_time = period - elapsed_time
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
 
-        a = (heading - vel_angle) % (np.pi)
-        b = (vel_angle - heading) % (np.pi)
-        yaw = -a if a < b else b
+            if not moog.is_engaged():
+                print('MOOG not engaged. Exiting Assetto program')
+                break
 
-        x_accel = sm.Physics.g_force.x
-        z_accel = sm.Physics.g_force.z
-        
-        # Gear shift dampening
-        gear = sm.Physics.gear
-        if gear != previous_gear:
-            gear_dampening_index = gear_dampening_window_size
-        # TODO: Test this
-        if gear_dampening_index > 0:
-            z_accel /= gear_dampening_scale_factor
-            gear_dampening_index -= 1
-        previous_gear = gear
+            roll = sm.Physics.roll
+            pitch = sm.Physics.pitch
+            heading = sm.Physics.heading
+            vel_x = sm.Physics.velocity.x
+            vel_z = sm.Physics.velocity.z
 
-        # Calculate angle from acceleration
-        x_angle = np.arcsin(
-            max(min(x_accel/9.81, x_accel_limit), -x_accel_limit))
-        z_angle = np.arcsin(
-            max(min(z_accel/9.81, z_accel_limit), -z_accel_limit))
+            if abs(vel_x) < yaw_vel_threshold and abs(vel_z) < yaw_vel_threshold:
+                vel_angle = heading
+            else:
+                vel_angle = -np.arctan2(vel_x, vel_z)
 
-        roll = roll + -x_angle
+            yaw = signed_angle_diff(vel_angle, heading)
 
-        pitch = -pitch + -z_angle
+            x_accel = sm.Physics.g_force.x
+            z_accel = sm.Physics.g_force.z
 
-        # Convert to degrees and scale
-        roll = roll_scale_factor * roll * 180 / np.pi
-        pitch = pitch_scale_factor * pitch * 180 / np.pi
-        yaw = yaw_scale_factor * yaw * 180 / np.pi
+            # Gear shift dampening
+            gear = sm.Physics.gear
+            if gear != previous_gear:
+                gear_dampening_index = gear_dampening_window_size
+            if gear_dampening_index > 0:
+                z_accel /= gear_dampening_scale_factor
+                gear_dampening_index -= 1
+            previous_gear = gear
 
-        # Limit degrees to max/min values from manual
-        roll = max(min(roll, roll_degree_excursion), -roll_degree_excursion)
-        pitch = max(min(pitch, pitch_degree_excursion), -pitch_degree_excursion)
-        yaw = max(min(yaw, yaw_degree_excursion), -yaw_degree_excursion)
+            # Calculate angle from acceleration
+            if g_force_is_in_g:
+                x_accel_normalized = x_accel
+                z_accel_normalized = z_accel
+            else:
+                x_accel_normalized = x_accel / 9.81
+                z_accel_normalized = z_accel / 9.81
 
+            x_angle = np.arcsin(np.clip(x_accel_normalized, -x_accel_limit, x_accel_limit))
+            z_angle = np.arcsin(np.clip(z_accel_normalized, -z_accel_limit, z_accel_limit))
 
-        # Map degrees to 0-32767 range for MOOG
-        roll = max(min(int(32767/58 * (roll + 29)), roll_actuator_max), roll_actuator_min)
-        pitch = max(min(int(32767/66 * (pitch + 33)), pitch_actuator_max), pitch_actuator_min)
-        yaw = max(min(int(32767/58 * (yaw + 29)), yaw_actuator_max), yaw_actuator_min)
+            roll = roll - x_angle
+            pitch = -pitch - z_angle
 
-        # Moving average filter
-        if not initialized:
-            roll_avg = np.full(roll_window_size, roll)
-            pitch_avg = np.full(pitch_window_size, pitch)
-            yaw_avg = np.full(yaw_window_size, yaw)
-            initialized = True
-        roll_avg[index % roll_window_size] = roll
-        pitch_avg[index % pitch_window_size] = pitch
-        yaw_avg[index % yaw_window_size] = yaw
+            # Convert to degrees and scale
+            roll = roll_scale_factor * np.degrees(roll)
+            pitch = pitch_scale_factor * np.degrees(pitch)
+            yaw = yaw_scale_factor * np.degrees(yaw)
 
-        index += 1
+            # Limit degrees to max/min values from manual
+            roll = np.clip(roll, -roll_degree_excursion, roll_degree_excursion)
+            pitch = np.clip(pitch, -pitch_degree_excursion, pitch_degree_excursion)
+            yaw = np.clip(yaw, -yaw_degree_excursion, yaw_degree_excursion)
 
-        final_roll = int(sum(roll_avg)/roll_window_size) 
-        final_pitch = int(sum(pitch_avg)/pitch_window_size) 
-        final_yaw = int(sum(yaw_avg)/yaw_window_size) 
+            # Map degrees to 0-32767 range for MOOG
+            roll = int(np.clip(32767 / 58 * (roll + 29), roll_actuator_min, roll_actuator_max))
+            pitch = int(np.clip(32767 / 66 * (pitch + 33), pitch_actuator_min, pitch_actuator_max))
+            yaw = int(np.clip(32767 / 58 * (yaw + 29), yaw_actuator_min, yaw_actuator_max))
 
-        # Send frame
-        try:
-            moog.command_dof(
-                roll=final_roll, pitch=final_pitch, yaw=final_yaw)
+            # Moving average filter
+            if not initialized:
+                roll_avg = np.full(roll_window_size, roll)
+                pitch_avg = np.full(pitch_window_size, pitch)
+                yaw_avg = np.full(yaw_window_size, yaw)
+                initialized = True
 
-        except Exception as e:
-            print(e)
+            roll_avg[index % roll_window_size] = roll
+            pitch_avg[index % pitch_window_size] = pitch
+            yaw_avg[index % yaw_window_size] = yaw
+            index += 1
 
-        # Calculate elapsed time and sleep for the remaining time
-        elapsed_time = time.time() - start_time
-        sleep_time = 1/frequency - elapsed_time
-        # TESTING IF SLEEP IS NECESSARY -- I don't think it is?
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+            final_roll = int(np.mean(roll_avg))
+            final_pitch = int(np.mean(pitch_avg))
+            final_yaw = int(np.mean(yaw_avg))
 
-    asm.close()
+            # Send frame
+            moog.command_dof(roll=final_roll, pitch=final_pitch, yaw=final_yaw)
+
+            # Calculate elapsed time and sleep for the remaining time
+            elapsed_time = time.monotonic() - start_time
+            sleep_time = period - elapsed_time
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    finally:
+        if asm is not None:
+            asm.close()
+        if moog is not None:
+            moog.close()
 
 
 if __name__ == "__main__":
