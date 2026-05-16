@@ -17,7 +17,7 @@ class MOOG():
     MACHINE_ID_LOW = 0x29
     MACHINE_ID_HIGH = 0x00
 
-    def __init__(self, port='COM3', baudrate=57600, frequency=60, timeout=0.01):
+    def __init__(self, port='COM3', baudrate=57600, frequency=60, timeout=0.002, frame_timeout=0.012):
         self.ser = serial.Serial(
             port=port,
             baudrate=baudrate,                          # Serial port transfer rate (bits/s)
@@ -29,6 +29,7 @@ class MOOG():
         )
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
+        self._frame_timeout = frame_timeout
 
         # TODO: Enumerate these
         self.command_types_hex = {
@@ -50,6 +51,7 @@ class MOOG():
         # Initial command to begin communication with the platform
         self._command = b"\xff\x82\x43\x00\x04\x00\x04\x00\x04\x00\x04\x00\x04\x00\x04\x29\x00"
         self._prev_command = self._command
+        self._rx_buffer = bytearray()
         self._command_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
@@ -67,6 +69,7 @@ class MOOG():
         self._status_bad_sync_count = 0
         self._status_bad_id_count = 0
         self._status_bad_state_count = 0
+        self._status_resync_count = 0
         self._status_error_count = 0
         self._last_status_time = None
 
@@ -141,24 +144,55 @@ class MOOG():
             with self._command_lock:
                 command = self._command
 
-        self.ser.write(command)                                 # Write current command to platform base
-        response_bytes = self.ser.read(20)                      # Read matching status frame
+        self.ser.write(command)  # Write current command to platform base
+        deadline = time.monotonic() + self._frame_timeout
 
-        if not response_bytes:
-            self._status_short_read_count += 1
-            self.text_output = 'No status frame received from platform'
-            return False
+        while time.monotonic() < deadline:
+            waiting = self.ser.in_waiting
+            bytes_to_read = waiting if waiting > 0 else 1
+            response_bytes = self.ser.read(bytes_to_read)
 
-        if len(response_bytes) != 20:
-            self._status_short_read_count += 1
-            self.text_output = f'Incomplete status frame: got {len(response_bytes)}/20 bytes'
-            return False
+            if response_bytes:
+                self._rx_buffer.extend(response_bytes)
+                frame = self._extract_status_frame()
+                if frame is not None:
+                    if self._parse_status_frame(frame):
+                        self._status_frame_count += 1
+                        return True
 
-        if self._parse_status_frame(response_bytes):
-            self._status_frame_count += 1
-            return True
-
+        self._status_short_read_count += 1
+        self.text_output = f'Timed out waiting for full status frame; buffered {len(self._rx_buffer)} bytes'
         return False
+
+    def _extract_status_frame(self):
+        frame_length = 20
+
+        while len(self._rx_buffer) >= frame_length:
+            sync_index = self._rx_buffer.find(b'\xff')
+            if sync_index < 0:
+                self._status_bad_sync_count += 1
+                self._status_resync_count += len(self._rx_buffer)
+                self._rx_buffer.clear()
+                return None
+
+            if sync_index > 0:
+                self._status_bad_sync_count += 1
+                self._status_resync_count += sync_index
+                del self._rx_buffer[:sync_index]
+
+            if len(self._rx_buffer) < frame_length:
+                return None
+
+            candidate = bytes(self._rx_buffer[:frame_length])
+            if candidate[18] == self.MACHINE_ID_LOW and candidate[19] == self.MACHINE_ID_HIGH:
+                del self._rx_buffer[:frame_length]
+                return candidate
+
+            self._status_bad_id_count += 1
+            self._status_resync_count += 1
+            del self._rx_buffer[0]
+
+        return None
 
     def _parse_status_frame(self, response_bytes):
         if response_bytes[0] != 0xff:
@@ -353,11 +387,14 @@ class MOOG():
             'status_bad_sync_count': self._status_bad_sync_count,
             'status_bad_id_count': self._status_bad_id_count,
             'status_bad_state_count': self._status_bad_state_count,
+            'status_resync_count': self._status_resync_count,
             'status_error_count': self._status_error_count,
             'last_status_age_s': self.get_status_age(),
+            'rx_buffer_len': len(self._rx_buffer),
             'state': self.state,
             'mode': self.mode,
         }
+
     def get_status_age(self):
         if self._last_status_time is None:
             return None
