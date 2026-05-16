@@ -14,6 +14,8 @@ class MOOG():
     DOF_NEUTRAL = 16383
     DOF_HEAVE_NEUTRAL = 29000
     LENGTH_NEUTRAL = 1024
+    MACHINE_ID_LOW = 0x29
+    MACHINE_ID_HIGH = 0x00
 
     def __init__(self, port='COM3', baudrate=57600, frequency=60, timeout=0.01):
         self.ser = serial.Serial(
@@ -50,8 +52,7 @@ class MOOG():
         self._prev_command = self._command
         self._command_lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._tx_thread = None
-        self._rx_thread = None
+        self._thread = None
 
         # Timing diagnostics for the 60 Hz transmit loop.
         self._last_send_time = None
@@ -64,7 +65,10 @@ class MOOG():
         self._status_frame_count = 0
         self._status_short_read_count = 0
         self._status_bad_sync_count = 0
+        self._status_bad_id_count = 0
+        self._status_bad_state_count = 0
         self._status_error_count = 0
+        self._last_status_time = None
 
         self.state = 'POWERUP'
         self.states = {
@@ -88,10 +92,8 @@ class MOOG():
         self._period = 1 / self._frequency
         self._initialized = False
 
-        self._tx_thread = threading.Thread(target=self.communication_loop, daemon=True)
-        self._rx_thread = threading.Thread(target=self.status_loop, daemon=True)
-        self._tx_thread.start()
-        self._rx_thread.start()
+        self._thread = threading.Thread(target=self.communication_loop, daemon=True)
+        self._thread.start()
         time.sleep(2)
         print("Ready to initialize")
 
@@ -112,7 +114,8 @@ class MOOG():
                 self.communicate(command)
             except (serial.SerialException, OSError) as exc:
                 self._transmit_error_count += 1
-                self.text_output = f"Serial transmit error: {exc}"
+                self._status_error_count += 1
+                self.text_output = f"Serial communication error: {exc}"
 
             next_tick += self._period
             now = time.monotonic()
@@ -125,46 +128,6 @@ class MOOG():
             missed_periods = max(1, int((-sleep_time) // self._period) + 1)
             self._deadline_miss_count += missed_periods
             next_tick += missed_periods * self._period
-
-    def status_loop(self):
-        bytes_to_read = 20
-        receive_buffer = bytearray()
-
-        while not self._stop_event.is_set():
-            try:
-                response_bytes = self.ser.read(bytes_to_read)
-            except (serial.SerialException, OSError) as exc:
-                self._status_error_count += 1
-                self.text_output = f"Serial status read error: {exc}"
-                continue
-
-            if not response_bytes:
-                continue
-
-            if len(response_bytes) != bytes_to_read:
-                self._status_short_read_count += 1
-
-            receive_buffer.extend(response_bytes)
-
-            while len(receive_buffer) >= bytes_to_read:
-                sync_index = receive_buffer.find(0xff)
-                if sync_index < 0:
-                    self._status_bad_sync_count += 1
-                    self.text_output = 'Dropped status bytes while searching for frame sync'
-                    receive_buffer.clear()
-                    break
-
-                if sync_index > 0:
-                    self._status_bad_sync_count += 1
-                    del receive_buffer[:sync_index]
-                    if len(receive_buffer) < bytes_to_read:
-                        break
-
-                frame = bytes(receive_buffer[:bytes_to_read])
-                del receive_buffer[:bytes_to_read]
-
-                if self._parse_status_frame(frame):
-                    self._status_frame_count += 1
 
     # min = 15 max = 120
     def override_frequency(self, new_freq):
@@ -179,12 +142,43 @@ class MOOG():
                 command = self._command
 
         self.ser.write(command)                                 # Write current command to platform base
-        return True
+        response_bytes = self.ser.read(20)                      # Read matching status frame
+
+        if not response_bytes:
+            self._status_short_read_count += 1
+            self.text_output = 'No status frame received from platform'
+            return False
+
+        if len(response_bytes) != 20:
+            self._status_short_read_count += 1
+            self.text_output = f'Incomplete status frame: got {len(response_bytes)}/20 bytes'
+            return False
+
+        if self._parse_status_frame(response_bytes):
+            self._status_frame_count += 1
+            return True
+
+        return False
 
     def _parse_status_frame(self, response_bytes):
         if response_bytes[0] != 0xff:
             self._status_bad_sync_count += 1
             self.text_output = f'Invalid frame sync byte: 0x{response_bytes[0]:02x}'
+            return False
+
+        if response_bytes[18] != self.MACHINE_ID_LOW or response_bytes[19] != self.MACHINE_ID_HIGH:
+            self._status_bad_id_count += 1
+            self.text_output = (
+                'Invalid motion base ID in status frame: '
+                f'0x{response_bytes[18]:02x} 0x{response_bytes[19]:02x}'
+            )
+            return False
+
+        machine_state_int = response_bytes[17]
+        state_code = machine_state_int & 0b1111
+        if state_code not in self.states:
+            self._status_bad_state_count += 1
+            self.text_output = f'Invalid machine state code in status frame: {state_code}'
             return False
 
         self.response = [f'{byte:02x}' for byte in response_bytes]
@@ -211,10 +205,9 @@ class MOOG():
         self.motion_base_id_low = self.response[18]
         self.motion_base_id_high = self.response[19]
 
-        machine_state_int = response_bytes[17]
-        state_code = machine_state_int & 0b1111
-        self.state = self.states.get(state_code, f'UNKNOWN({state_code})')
+        self.state = self.states[state_code]
         self.mode = (machine_state_int >> 4) & 1
+        self._last_status_time = time.monotonic()
         return True
 
     # command_type string corresponding to hex in dict ; commands list of ints
@@ -229,8 +222,8 @@ class MOOG():
             raise ValueError('MOOG frames require exactly 6 command values')
 
         command_prefix_hex = 0xff  # frame sync
-        command_machine_id_low = 0x29
-        command_machine_id_high = 0x00
+        command_machine_id_low = self.MACHINE_ID_LOW
+        command_machine_id_high = self.MACHINE_ID_HIGH
 
         command_type_hex = self.command_types_hex[command_type]
 
@@ -323,11 +316,8 @@ class MOOG():
         self._initialized = False
         self._stop_event.set()
 
-        if self._tx_thread is not None and self._tx_thread.is_alive():
-            self._tx_thread.join(timeout=1.0)
-
-        if self._rx_thread is not None and self._rx_thread.is_alive():
-            self._rx_thread.join(timeout=1.0)
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
         if self.ser.is_open:
             self.ser.close()
@@ -361,10 +351,17 @@ class MOOG():
             'status_frame_count': self._status_frame_count,
             'status_short_read_count': self._status_short_read_count,
             'status_bad_sync_count': self._status_bad_sync_count,
+            'status_bad_id_count': self._status_bad_id_count,
+            'status_bad_state_count': self._status_bad_state_count,
             'status_error_count': self._status_error_count,
+            'last_status_age_s': self.get_status_age(),
             'state': self.state,
             'mode': self.mode,
         }
+    def get_status_age(self):
+        if self._last_status_time is None:
+            return None
+        return time.monotonic() - self._last_status_time
 
     def low_limit_enable(self):
         self.command('LOW LIMIT ENABLE')

@@ -66,6 +66,8 @@ def main():
         frequency = 120  # Hz
         period = 1 / frequency
         previous_gear = 0
+        disengaged_since = None
+        disengaged_timeout = 0.5
 
         while True:
             start_time = time.monotonic()
@@ -78,9 +80,16 @@ def main():
                     time.sleep(sleep_time)
                 continue
 
-            if not moog.is_engaged():
-                print('MOOG not engaged. Exiting Assetto program')
-                break
+            if moog.is_engaged():
+                disengaged_since = None
+            else:
+                if disengaged_since is None:
+                    disengaged_since = time.monotonic()
+                elif time.monotonic() - disengaged_since >= disengaged_timeout:
+                    print('MOOG not engaged. Exiting Assetto program')
+                    print(f'MOOG state: {moog.state}')
+                    print(f'MOOG status stats: {moog.get_status_stats()}')
+                    break
 
             roll = sm.Physics.roll
             pitch = sm.Physics.pitch
