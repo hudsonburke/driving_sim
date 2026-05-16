@@ -13,8 +13,8 @@ yaw_vel_threshold = 0.5
 gear_dampening_scale_factor = 7
 gear_dampening_window_size = 20
 
-roll_scale_factor = 0.4
-pitch_scale_factor = 0.4
+roll_scale_factor = 1.0
+pitch_scale_factor = 1.0
 yaw_scale_factor = 1.0
 
 roll_degree_excursion = 25
@@ -44,17 +44,15 @@ def main():
 
     try:
         moog = MOOG()
-        asm = accSharedMemory()
-
-        if moog.state in {'FAULT2', 'FAULT3', 'INHIBITED'}:
-            print('Resetting...')
-            if not moog.wait_until(lambda: moog.state == 'IDLE', timeout=5.0, on_poll=moog.reset):
-                raise TimeoutError(f'Timed out resetting MOOG. Current state: {moog.state}')
-        elif moog.state != 'IDLE':
-            if not moog.wait_until(lambda: moog.state == 'IDLE', timeout=5.0):
-                raise TimeoutError(f'Timed out waiting for MOOG to become IDLE. Current state: {moog.state}')
+        time.sleep(2)
+        
+        print('Resetting...')
+        if not moog.wait_until(lambda: moog.state == 'IDLE', timeout=30.0, on_poll=moog.reset):
+            raise TimeoutError(f'Timed out waiting for MOOG to become IDLE. Current state: {moog.state}')
 
         moog.initialize_platform()
+        
+        asm = accSharedMemory()
 
         roll_avg = np.zeros(roll_window_size)
         pitch_avg = np.zeros(pitch_window_size)

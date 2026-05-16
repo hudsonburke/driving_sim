@@ -266,17 +266,17 @@ class MOOG():
         if self.state in {'FAULT2', 'FAULT3', 'INHIBITED'}:
             raise RuntimeError('MOOG must be reset before initialization')
 
-        if not self.wait_until(lambda: self.mode == 1, timeout=3.0, on_poll=self.dof_mode):
+        if not self.wait_until(lambda: self.mode == 1, timeout=10.0, on_poll=self.dof_mode):
             raise TimeoutError(f'Timed out entering DOF mode. Current state: {self.state}')
 
         # Continue to send
         self.command_dof()
         time.sleep(1)
 
-        if not self.wait_until(lambda: self.state == 'STANDBY', timeout=5.0, on_poll=self.engage):
+        if not self.wait_until(lambda: self.state == 'STANDBY', timeout=10.0, on_poll=self.engage):
             raise TimeoutError(f'Timed out entering STANDBY. Current state: {self.state}')
 
-        if not self.wait_until(lambda: self.state == 'ENGAGED', timeout=5.0, on_poll=self.command_dof):
+        if not self.wait_until(lambda: self.state == 'ENGAGED', timeout=30.0, on_poll=self.command_dof):
             raise TimeoutError(f'Timed out entering ENGAGED. Current state: {self.state}')
 
         print('Engaged')
